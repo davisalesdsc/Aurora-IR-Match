@@ -1,0 +1,260 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (AU + VST3, Universal)
+            os: macos-15
+          - name: Windows (VST3)
+            os: windows-latest
+          - name: Linux (VST3)
+            os: ubuntu-24.04
+
+    env:
+      PLUGIN: Aurora IR Match
+      ART: build/AuroraIRMatch_artefacts/Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxext-dev libfontconfig1-dev libfreetype-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then T=./build/AuroraTests_artefacts/Release/AuroraTests.exe
+          else T=./build/AuroraTests_artefacts/Release/AuroraTests; fi
+          $T
+          mkdir -p dist
+          $T --snapshot dist/aurora-$RUNNER_OS.png || true
+
+      - name: Load the VST3 like a DAW (Windows / Linux)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then L=./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest.exe
+          else L=./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest; fi
+          $L "$ART/VST3/$PLUGIN.vst3"
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^project(AuroraIRMatch VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then LABEL="$GITHUB_REF_NAME"
+          elif [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == push ]]; then LABEL="v$VERSION"
+          else LABEL="dev-${GITHUB_SHA::7}"; fi
+          echo "VERSION_LABEL=$LABEL" >> "$GITHUB_ENV"
+          echo "PROJECT_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "label=$LABEL version=$VERSION"
+
+      # Fails the build if the plugin would require a newer macOS than intended
+      # (x86_64: 10.13; arm64: 11.0, the first macOS for Apple Silicon)
+      - name: Check minimum macOS version
+        if: runner.os == 'macOS'
+        run: |
+          for bin in "$ART/VST3/$PLUGIN.vst3/Contents/MacOS/$PLUGIN" "$ART/AU/$PLUGIN.component/Contents/MacOS/$PLUGIN"; do
+            for arch in x86_64 arm64; do
+              minos=$(vtool -arch $arch -show-build "$bin" | awk '$1 == "minos" || $1 == "version" {print $2; exit}')
+              if [ -z "$minos" ]; then echo "::error::could not read the minimum macOS of $bin [$arch]"; exit 1; fi
+              echo "$bin [$arch] minos=$minos"
+              limit=10.13; [ "$arch" = arm64 ] && limit=11.0
+              if [ "$(printf '%s\n%s\n' "$minos" "$limit" | sort -V | tail -1)" != "$limit" ]; then
+                echo "::error::$arch requires macOS $minos (expected <= $limit)"; exit 1
+              fi
+            done
+          done
+
+      # Ad-hoc signature so Apple Silicon hosts load the bundles (no Apple account needed)
+      - name: Ad-hoc sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - "$ART/AU/$PLUGIN.component"
+          codesign --force --deep --sign - "$ART/VST3/$PLUGIN.vst3"
+
+      - name: Build installer (.pkg)
+        if: runner.os == 'macOS'
+        run: |
+          packaging/macos/build_pkg.sh "$ART" "$PROJECT_VERSION" "dist/Aurora-IR-Match-$VERSION_LABEL-macOS.pkg"
+
+      # Install the .pkg exactly like a user would, then validate the installed plugin
+      - name: Test installer + validate AU (auval)
+        if: runner.os == 'macOS'
+        run: |
+          sudo installer -pkg "dist/Aurora-IR-Match-$VERSION_LABEL-macOS.pkg" -target /
+          test -d "/Library/Audio/Plug-Ins/Components/$PLUGIN.component"
+          test -d "/Library/Audio/Plug-Ins/VST3/$PLUGIN.vst3"
+          pkgutil --pkgs | grep com.aurora.irmatch
+          codesign --verify --deep --strict "/Library/Audio/Plug-Ins/Components/$PLUGIN.component"
+          killall -9 AudioComponentRegistrar || true
+          auval -v aufx Arm1 Aura
+
+      - name: Load installed plugins like a DAW (macOS Apple Silicon)
+        if: runner.os == 'macOS'
+        run: |
+          uname -m; sw_vers -productVersion
+          ./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest "/Library/Audio/Plug-Ins/VST3/$PLUGIN.vst3"
+          ./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest AU
+
+      # Zip on the runner itself so bundle structure and permissions survive
+      - name: Package
+        shell: bash
+        run: |
+          NAME="Aurora-IR-Match-$VERSION_LABEL-$RUNNER_OS"
+          mkdir -p "dist/$NAME"
+          for f in "AU/$PLUGIN.component" "VST3/$PLUGIN.vst3"; do
+            if [ -e "$ART/$f" ]; then cp -R "$ART/$f" "dist/$NAME/"; fi
+          done
+          cd dist
+          case "$RUNNER_OS" in
+            macOS)   ditto -c -k --keepParent "$NAME" "$NAME.zip" ;;
+            Windows) 7z a -tzip "$NAME.zip" "$NAME" > /dev/null ;;
+            *)       zip -qry "$NAME.zip" "$NAME" ;;
+          esac
+          rm -rf "$NAME"
+          ls -la
+
+      - name: Upload plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aurora-${{ runner.os }}
+          path: |
+            dist/*.zip
+            dist/*.pkg
+          if-no-files-found: error
+
+      - name: Upload screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ runner.os }}
+          path: dist/*.png
+          if-no-files-found: ignore
+
+  # Install the .pkg on an INTEL Mac and load both plugins like a DAW does
+  mac-intel:
+    name: macOS Intel (install .pkg + load like a DAW)
+    needs: build
+    runs-on: macos-15-intel
+    env:
+      PLUGIN: Aurora IR Match
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Aurora-macOS
+          path: dist
+
+      - name: Install the .pkg
+        run: |
+          uname -m; sw_vers -productVersion
+          ls -la dist
+          sudo installer -pkg dist/*.pkg -target /
+          killall -9 AudioComponentRegistrar || true
+
+      - name: Build the loader (native x86_64)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64
+          cmake --build build --config Release --target AuroraPluginLoadTest --parallel 4
+
+      - name: Load VST3 and AU like a DAW
+        run: |
+          ./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest "/Library/Audio/Plug-Ins/VST3/$PLUGIN.vst3"
+          ./build/AuroraPluginLoadTest_artefacts/Release/AuroraPluginLoadTest AU
+          auval -v aufx Arm1 Aura | tail -5
+
+  # Every push to main creates/updates the release for the version in CMakeLists.txt
+  # (bump VERSION there to start a new release). Pushing a v* tag also works.
+  release:
+    name: Publish GitHub Release
+    needs: [ build, mac-intel ]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="$GITHUB_REF_NAME"
+          else TAG="v$(sed -n 's/^project(AuroraIRMatch VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "tag=$TAG"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Aurora-*
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Aurora IR Match ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          overwrite_files: true
+          files: |
+            dist/*.pkg
+            dist/*.zip
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            | Sistema | Arquivo | O que é |
+            |---|---|---|
+            | **macOS** (Apple Silicon + Intel) | `Aurora-IR-Match-${{ env.TAG }}-macOS.pkg` | **Instalador** (AU + VST3) — recomendado |
+            | macOS | `Aurora-IR-Match-${{ env.TAG }}-macOS.zip` | Plugins soltos, para instalar manualmente |
+            | Windows | `Aurora-IR-Match-${{ env.TAG }}-Windows.zip` | VST3 |
+            | Linux | `Aurora-IR-Match-${{ env.TAG }}-Linux.zip` | VST3 |
+
+            ## Como usar
+
+            1. Baixe os IRs de violão que quiser em **acousticir.ovh** (botão **BAIXAR IRs** no plugin) e coloque todos numa pasta.
+            2. Coloque o **Aurora IR Match** no FX do canal do violão e clique em **ESCOLHER PASTA**.
+            3. Aperte **LEARN · CAPTADOR** e toque por uns 15 segundos (acordes, dedilhado, graves e agudos).
+               O plugin compara o seu captador com todos os IRs e já carrega o melhor, com a mistura certa.
+            4. Ajuste o **MIX** (linha ↔ IR) e o **TOM** a gosto. As 3 sugestões ficam na tela para comparar.
+
+            **Tem um microfone também?** Grave/toque com o captador no canal 1 (L) e o microfone no canal 2 (R)
+            de uma faixa estéreo e use **LEARN · CAPTADOR + MICROFONE**: o plugin cria o IR do *seu* violão
+            e salva em `Meus IRs Aurora`, dentro da pasta da biblioteca.
+
+            ## Instalar no macOS
+
+            Abra o `.pkg` e siga o instalador. Ele ainda não é assinado pela Apple: na primeira vez vá em
+            **Ajustes do Sistema → Privacidade e Segurança → Abrir Mesmo Assim**. Ou pelo Terminal:
+
+            ```
+            sudo installer -pkg ~/Downloads/Aurora-IR-Match-${{ env.TAG }}-macOS.pkg -target /
+            ```
+
+            ## Instalar no Windows / Linux
+
+            Copie `Aurora IR Match.vst3` para `C:\Program Files\Common Files\VST3\` (Windows) ou `~/.vst3/` (Linux).
